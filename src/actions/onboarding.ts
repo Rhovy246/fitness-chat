@@ -19,7 +19,7 @@ export async function verifyMemberCode(formData: FormData) {
 
   const parsed = verifyCodeSchema.safeParse({ code: formData.get('code') })
   if (!parsed.success) {
-    return { error: parsed.error.errors[0]?.message ?? 'invalid input' }
+    return { error: parsed.error.issues[0]?.message ?? 'invalid input' }
   }
 
   const code = parsed.data.code.trim().toUpperCase()

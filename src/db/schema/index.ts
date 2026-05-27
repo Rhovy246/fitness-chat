@@ -1,3 +1,4 @@
 export * from './tenants'
 export * from './coaches'
 export * from './members'
+export * from './chat'
