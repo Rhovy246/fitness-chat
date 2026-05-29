@@ -3,10 +3,8 @@ import { Redis } from '@upstash/redis'
 import { eq, and, desc } from 'drizzle-orm'
 import { createClient } from '@/lib/supabase/server'
 import { db } from '@/db'
-import { members, intakeSubmissions } from '@/db/schema'
-import { threads, messages as chatMessages } from '@/db/schema'
+import { members, intakeSubmissions, threads, messages as chatMessages } from '@/db/schema'
 import { anthropic } from '@/lib/ai/client'
-import { PERSONAS, type CoachPersonaId } from '@/lib/ai/personas'
 import { buildSystemPrompt, buildMessages } from '@/lib/ai/prompt'
 
 const redis = new Redis({
@@ -19,7 +17,7 @@ const BodySchema = z.object({
   content: z.string().min(1).max(4000),
 })
 
-const DAILY_MESSAGE_LIMIT = 20
+const DAILY_MESSAGE_LIMIT = 30
 const HISTORY_LIMIT = 20
 const MODEL = 'claude-sonnet-4-6'
 
@@ -46,7 +44,7 @@ export async function POST(request: Request) {
     .limit(1)
   if (!member) return Response.json({ error: 'Member not found' }, { status: 404 })
 
-  // 4. rate limit — 20 messages per member per UTC day
+  // 4. rate limit — 30 messages per member per UTC day across all threads
   const today = new Date().toISOString().slice(0, 10)
   const rateKey = `chat:rate:${member.id}:${today}`
   const msgCount = await redis.incr(rateKey)
@@ -55,13 +53,20 @@ export async function POST(request: Request) {
     return Response.json({ error: 'Daily message limit reached' }, { status: 429 })
   }
 
-  // 5. thread (verify ownership)
+  // 5. thread (verify ownership, skip soft-deleted)
   const [thread] = await db
     .select()
     .from(threads)
-    .where(and(eq(threads.id, threadId), eq(threads.memberId, member.id)))
+    .where(
+      and(
+        eq(threads.id, threadId),
+        eq(threads.memberId, member.id),
+      ),
+    )
     .limit(1)
-  if (!thread) return Response.json({ error: 'Thread not found' }, { status: 404 })
+  if (!thread || thread.deletedAt) {
+    return Response.json({ error: 'Thread not found' }, { status: 404 })
+  }
 
   // 6. latest intake
   const [latestIntake] = await db
@@ -83,7 +88,7 @@ export async function POST(request: Request) {
   // 8. save user message
   const [savedUserMsg] = await db
     .insert(chatMessages)
-    .values({ threadId, memberId: member.id, role: 'user', content })
+    .values({ threadId, role: 'user', content })
     .returning()
 
   if (!savedUserMsg) {
@@ -91,9 +96,7 @@ export async function POST(request: Request) {
   }
 
   // 9. build prompt
-  const personaId = (thread.coachPersona as CoachPersonaId | null) ?? 'strength'
-  const persona = PERSONAS[personaId] ?? PERSONAS.strength
-  const systemPrompt = buildSystemPrompt(persona, latestIntake?.data ?? null)
+  const systemPrompt = buildSystemPrompt(latestIntake?.data ?? null)
   const anthropicMessages = buildMessages(history, content)
 
   // 10. stream
@@ -128,12 +131,11 @@ export async function POST(request: Request) {
           .map((b) => (b as { type: 'text'; text: string }).text)
           .join('')
 
-        // save assistant message
+        // save assistant message with token counts for cost observability
         const [savedAssistantMsg] = await db
           .insert(chatMessages)
           .values({
             threadId,
-            memberId: member.id,
             role: 'assistant',
             content: fullText,
             modelUsed: MODEL,
@@ -141,6 +143,12 @@ export async function POST(request: Request) {
             tokensOutput: finalMsg.usage.output_tokens,
           })
           .returning()
+
+        // update thread's last_message_at
+        await db
+          .update(threads)
+          .set({ lastMessageAt: new Date(), updatedAt: new Date() })
+          .where(eq(threads.id, threadId))
 
         send({ type: 'done', messageId: savedAssistantMsg?.id })
         controller.close()
